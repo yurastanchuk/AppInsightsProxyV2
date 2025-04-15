@@ -32,9 +32,8 @@ AppInsightsProxy{
         using var reader = new StreamReader(request.Body);
         var body = await reader.ReadToEndAsync();
 
-        var batchSize = 5000; 
-        if (int.TryParse(request.Headers["X-Take-Limit"].FirstOrDefault(), out var parsedLimit))
-            batchSize = parsedLimit;
+        // Batch size is required to avoid out of memory exception at azure. It supports up to 20MB per query
+        var batchSize = int.TryParse(request.Headers["x-batch-size"].FirstOrDefault(), out var parsedLimit) ? parsedLimit : 5000; 
 
         if (string.IsNullOrWhiteSpace(body))
             return new BadRequestObjectResult("Empty request body");
@@ -48,13 +47,13 @@ AppInsightsProxy{
             return new BadRequestObjectResult("Invalid JSON body or missing 'query' property");
         }
 
-        var fromTime = ExtractStartTime(query);
-        var toTime = ExtractEndTime(query);
+        if (!TryParseStartDateTime(query, out var startDateTime))
+            return new BadRequestObjectResult("Start DateTime must be specified in the query");
 
-        var response = new StringBuilder();
-        response.Append("[");
+        var fromTime = DateTime.TryParse(request.Headers["x-date-start"].FirstOrDefault(), out var batchDateStart) ? batchDateStart : startDateTime;
+        var toTime = int.TryParse(request.Headers["x-date-interval"].FirstOrDefault(), out var dateInterval) ? fromTime.AddMinutes(dateInterval) : DateTime.MaxValue;
 
-        var hasWritten = false;
+        var records = new List<JsonObject>();
 
         while (true) {
             var paginatedQuery = $"{query} | where timestamp >= datetime('{fromTime:O}') and timestamp < datetime('{toTime:O}') | order by timestamp asc | take {batchSize}";
@@ -63,14 +62,9 @@ AppInsightsProxy{
             if (appInsightsResponse is not { columns: { Count: > 0 }, rows: { Count: > 0 } })
                 break;
 
-            foreach (var record in GetRecords(appInsightsResponse.columns, appInsightsResponse.rows)) {
-                if (hasWritten)
-                    response.Append(",\n");
-
-                response.Append(JsonSerializer.Serialize(record));
-                hasWritten = true;
-            }
-
+            foreach (var record in GetRecords(appInsightsResponse.columns, appInsightsResponse.rows)) 
+                records.Add(record);
+            
             if (appInsightsResponse.rows.Count < batchSize)
                 break;
 
@@ -78,10 +72,8 @@ AppInsightsProxy{
             fromTime = lastTimestamp;
         }
 
-        var result = response.ToString();
-        response.Append("\n]");
         return new ContentResult {
-            Content = result,
+            Content = JsonSerializer.Serialize(records),
             ContentType = "application/json",
             StatusCode = 200
         };
@@ -159,15 +151,11 @@ AppInsightsProxy{
         }
     }
 
-    private static DateTime 
-    ExtractStartTime(string query) {
-        var match = System.Text.RegularExpressions.Regex.Match(query, @"timestamp\s*>=\s*datetime\('([^']+)'\)");
-        return match.Success && DateTime.TryParse(match.Groups[1].Value, out var dateTime) ? dateTime : DateTime.UtcNow.AddHours(-1);
-    }
-
-    private static DateTime
-    ExtractEndTime(string query) {
-        var match = System.Text.RegularExpressions.Regex.Match(query, @"timestamp\s*<\s*datetime\('([^']+)'\)");
-        return match.Success && DateTime.TryParse(match.Groups[1].Value, out var dateTime) ? dateTime : DateTime.UtcNow;
+    private static bool 
+    TryParseStartDateTime(string query, out DateTime dateTime) {
+        dateTime = DateTime.MinValue;
+        //timestamp > datetime is important, >= cant be used, because previous latest record timestamp is used as cursor for new record to be fetched
+        var match = System.Text.RegularExpressions.Regex.Match(query, @"timestamp\s*>\s*datetime\('([^']+)'\)");
+        return match.Success && DateTime.TryParse(match.Groups[1].Value, out dateTime);
     }
 }
